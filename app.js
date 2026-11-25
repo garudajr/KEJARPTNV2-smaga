@@ -786,7 +786,7 @@
         <label>Target Jurusan / PTN
           <input name="jur" value="${esc(S.jur)}" placeholder="mis. Teknik Informatika — ITS">
         </label>
-        <a href="https://snpmb.bppp.kemdikbud.go.id/" target="_blank" rel="noopener" class="bt bt-soft" style="text-decoration:none;font-size:13px;">
+        <a href="https://snpmb.id/snbp/daya-tampung-snbp" target="_blank" rel="noopener" class="bt bt-soft" style="text-decoration:none;font-size:13px;">
           🌐 Cek Daya Tampung & Prodi di Portal Resmi SNPMB ↗
         </a>
         <label>Target Skor SNBP
