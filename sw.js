@@ -1,4 +1,4 @@
-const C = 'kp-v11',
+const C = 'kp-v12',
   CDN = 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js',
   FC = 'https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap',
   ASSETS = ['./', 'index.html', 'style.css', 'app.js', 'manifest.json'];

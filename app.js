@@ -1,7 +1,10 @@
 /**
- * Kejar PTN! v2.2 — SMAN 3 Kota Blitar (Kelas XI-2)
+ * Kejar PTN! v2.3 — SMAN 3 Kota Blitar (Kelas XI-2)
  * Unified Offline-First IndexedDB + Google Apps Script Auth & Sync
- * Perbaikan: Sanitasi Escape Quote, Normalisasi Opsi JSON, Auto-Sync Antrean Offline, & Batal/Replay Sesi
+ * Pembaruan:
+ * 1. Batas Soal Ujian ASAS: Maks. 40 Soal (IPA: Biologi, Fisika, Kimia) & Maks. 35 Soal (Non-IPA)
+ * 2. Auto-Sync Lintas Perangkat (Auto-Pull saat buka & kembali aktif + Retry & Smart Sync Pill)
+ * 3. Perbaikan Ukuran Kartu & Canvas Grafik pada HP, Tablet, dan Laptop
  */
 (function () {
   'use strict';
@@ -27,6 +30,11 @@
     'STS/PTS': 0,
     PAS: 0
   };
+
+  // Kelompok IPA (maks 40 soal ujian) vs Non-IPA (maks 35 soal ujian)
+  const IPA_IDS = new Set(['BIO-F', 'FIS-F', 'KIM-F']);
+  const isMapelIPA = (mapelId) => IPA_IDS.has(mapelId);
+  const getMaxExamQuestions = (mapelId) => (isMapelIPA(mapelId) ? 40 : 35);
 
   const JADWAL_ASAS = [
     { id: 'BIN-F', mapel: 'Bahasa Indonesia', hari: 'Senin, 30 Nov 2026', sesi: 'Sesi 1 (07.00–09.00)', menit: 120 },
@@ -71,6 +79,7 @@
   let cbtSession = null;
   let timerId = null;
   let countdownId = null;
+  let isSyncingNow = false;
 
   /* =========================================================
      UNIFIED INDEXEDDB (kejarptn_v2) + MIGRASI DATA LAMA
@@ -269,7 +278,7 @@
   }
 
   /* =========================================================
-     CLOUD SYNC & AUTH (GOOGLE APPS SCRIPT)
+     CLOUD SYNC & AUTH (GOOGLE APPS SCRIPT + AUTO-PULL)
      ========================================================= */
   function getSession() {
     try { return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); } catch { return null; }
@@ -291,7 +300,8 @@
     el.hidden = false;
     const hasPending = localStorage.getItem(PENDING_SYNC_KEY) === '1';
     el.textContent = (navigator.onLine ? (hasPending ? '🔄 @' : '☁️ @') : '📴 @') + u.username;
-    el.onclick = () => syncPush(false);
+    el.title = 'Ketuk untuk menyinkronkan data Cloud';
+    el.onclick = () => smartSyncNow();
   }
 
   function buildSyncPayload() {
@@ -357,32 +367,41 @@
     return true;
   }
 
-  async function callApi(body) {
-    const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 20000);
-    try {
-      const res = await fetch(SYNC_API_URL, {
-        method: 'POST',
-        body: JSON.stringify(body),
-        signal: ctrl.signal
-      });
-      const json = await res.json();
-      if (!json.ok) throw new Error(json.error || 'Gagal terhubung ke server.');
-      return json;
-    } finally {
-      clearTimeout(to);
+  async function callApi(body, retries = 1) {
+    let lastErr;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 22000);
+      try {
+        const res = await fetch(SYNC_API_URL, {
+          method: 'POST',
+          body: JSON.stringify(body),
+          signal: ctrl.signal
+        });
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || 'Gagal terhubung ke server.');
+        return json;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < retries) await new Promise((r) => setTimeout(r, 800));
+      } finally {
+        clearTimeout(to);
+      }
     }
+    throw lastErr;
   }
 
   async function syncPush(silent = true) {
     const u = getSession();
-    if (!u) return;
+    if (!u) return false;
     if (!navigator.onLine) {
       localStorage.setItem(PENDING_SYNC_KEY, '1');
       updateSyncPill();
       if (!silent) toast('Offline: perubahan masuk antrean sync.');
-      return;
+      return false;
     }
+    if (isSyncingNow) return false;
+    isSyncingNow = true;
     const pillEl = $('#sync-pill');
     if (pillEl) pillEl.textContent = '⏳ Sync...';
     try {
@@ -391,34 +410,64 @@
         username: u.username,
         token: u.token,
         payload: buildSyncPayload()
-      });
+      }, 1);
       localStorage.removeItem(PENDING_SYNC_KEY);
       u.lastSync = resp.lastSync;
       saveSession(u);
       if (!silent) toast('Data tersinkron ke Cloud ✓');
+      return true;
     } catch (err) {
       localStorage.setItem(PENDING_SYNC_KEY, '1');
       updateSyncPill();
       if (!silent) toast('Gagal sync: ' + err.message);
+      return false;
+    } finally {
+      isSyncingNow = false;
+      updateSyncPill();
     }
   }
 
-  async function syncPull() {
+  async function syncPull(silent = false) {
     const u = getSession();
-    if (!u) return;
-    if (!navigator.onLine) return toast('Butuh koneksi internet untuk menarik data.');
-    toast('Mengambil data dari Cloud...');
+    if (!u) return false;
+    if (!navigator.onLine) {
+      if (!silent) toast('Butuh koneksi internet untuk menarik data.');
+      return false;
+    }
+    if (isSyncingNow) return false;
+    isSyncingNow = true;
+    const pillEl = $('#sync-pill');
+    if (pillEl && !silent) pillEl.textContent = '⏳ Cek Cloud...';
     try {
-      const resp = await callApi({ action: 'pull', username: u.username, token: u.token });
-      if (!resp.payload) return toast('Belum ada cadangan di Cloud.');
-      await applySyncPayload(resp.payload);
-      localStorage.removeItem(PENDING_SYNC_KEY);
-      u.lastSync = resp.lastSync;
-      saveSession(u);
-      toast('Data berhasil dipulihkan ✓');
-      go(T, 1);
+      const resp = await callApi({ action: 'pull', username: u.username, token: u.token }, 1);
+      if (!resp.payload) {
+        if (!silent) toast('Belum ada cadangan di Cloud.');
+        return false;
+      }
+      const isCloudNewer = !u.lastSync || (resp.lastSync && resp.lastSync !== u.lastSync);
+      if (!silent || isCloudNewer) {
+        await applySyncPayload(resp.payload);
+        localStorage.removeItem(PENDING_SYNC_KEY);
+        u.lastSync = resp.lastSync;
+        saveSession(u);
+        if (!cbtSession) go(T, 1);
+        if (!silent) toast('Data terbaru dari Cloud berhasil dimuat ✓');
+      }
+      return true;
     } catch (err) {
-      toast('Gagal tarik data: ' + err.message);
+      if (!silent) toast('Gagal tarik data: ' + err.message);
+      return false;
+    } finally {
+      isSyncingNow = false;
+      updateSyncPill();
+    }
+  }
+
+  async function smartSyncNow() {
+    if (localStorage.getItem(PENDING_SYNC_KEY) === '1') {
+      await syncPush(false);
+    } else {
+      await syncPull(false);
     }
   }
 
@@ -486,14 +535,15 @@
               password,
               nama: S.nama,
               initialPayload: buildSyncPayload()
-            });
+            }, 1);
             saveSession(res.user);
             root.innerHTML = '';
             go('home');
             toast('Akun berhasil dibuat ✓');
           } else {
-            const res = await callApi({ action: 'login', username, password });
-            saveSession(res.user);
+            const res = await callApi({ action: 'login', username, password }, 1);
+            const userSession = { ...res.user, lastSync: res.user.lastSync || '' };
+            saveSession(userSession);
             if (res.payload) {
               await applySyncPayload(res.payload);
             } else if (res.user.nama) {
@@ -634,7 +684,7 @@
     </div>
   `);
 
-  // 4. GRAFIK (SEMESTER 1–5 & SEMUA)
+  // 4. GRAFIK (RESPONSIF PRESISI DI HP, TABLET, & LAPTOP)
   V.gr = () => {
     const allMapels = [...new Set([...FF, ...FE])];
     return `
@@ -648,13 +698,13 @@
           </select>
         </label>
       </div>
-      <div class="c">
-        <b style="display:block;margin-bottom:8px;">Tren SNBP Semester 1–5</b>
-        <canvas id="c1"></canvas>
+      <div class="c w">
+        <b style="display:block;margin-bottom:10px;">Tren SNBP Semester 1–5</b>
+        <div class="chart-box"><canvas id="c1"></canvas></div>
       </div>
-      <div class="c">
-        <b style="display:block;margin-bottom:8px;">Detail Nilai per Mapel & Semester</b>
-        <canvas id="c2"></canvas>
+      <div class="c w">
+        <b style="display:block;margin-bottom:10px;">Detail Nilai per Mapel & Semester</b>
+        <div class="chart-box"><canvas id="c2"></canvas></div>
       </div>
     `;
   };
@@ -668,7 +718,12 @@
       label: l, data: d, borderColor: c, backgroundColor: c,
       tension: 0.3, pointRadius: 4, spanGaps: true, ...x
     });
-    const opts = { responsive: true, scales: { y: { min: 0, max: 100 } }, plugins: { legend: { position: 'bottom' } } };
+    const opts = {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: { y: { min: 0, max: 100 } },
+      plugins: { legend: { position: 'bottom' } }
+    };
     const L = [1, 2, 3, 4, 5].map((n) => 'Sem ' + n);
 
     CH.push(new Chart($('#c1'), {
@@ -702,14 +757,19 @@
   }
   AF.gr = dc;
 
-  // 5. EXAM (SIMULASI ASAS & MODE KUIS JADI SATU + RIWAYAT)
+  // 5. EXAM (SIMULASI ASAS MAKS 40 IPA / 35 NON-IPA & MODE KUIS + RIWAYAT)
   V.exam = () => {
+    const syncBtnHTML = getSession()
+      ? `<button type="button" class="pl" style="margin-left:auto;background:#EFF6FF;border-color:#BFDBFE;color:var(--b);" onclick="KP.syncPull(false)">↻ Tarik Soal Cloud</button>`
+      : '';
+
     if (EX_TAB === 'riwayat') {
       return `
         <div class="c w">
           <div class="tb">
             ${pill(false, 'Daftar Mapel (ASAS & Kuis)', "KP.setExTab('list')")}
             ${pill(true, `Riwayat (${HISTORY.length})`, "KP.setExTab('riwayat')", 'on-blue')}
+            ${syncBtnHTML}
           </div>
         </div>
         ${HISTORY.length === 0 ? `
@@ -747,20 +807,25 @@
         <div class="tb">
           ${pill(true, 'Daftar Mapel (ASAS & Kuis)', "KP.setExTab('list')", 'on-blue')}
           ${pill(false, `Riwayat (${HISTORY.length})`, "KP.setExTab('riwayat')")}
+          ${syncBtnHTML}
         </div>
       </div>
       ${JADWAL_ASAS.map((j) => {
         const bank = BANKS[j.id];
         const total = bank && Array.isArray(bank.soal) ? bank.soal.length : 0;
+        const maxUjian = getMaxExamQuestions(j.id);
         return `
           <div class="c ex-card">
             <div class="ex-top">
               <div>
                 <h4 style="font-size:16px;font-weight:800;">${esc(j.mapel)}</h4>
                 <small class="mu">${esc(j.hari)} · ${esc(j.sesi)}</small>
+                <small class="mu" style="display:block;font-size:11px;margin-top:2px;">
+                  Ujian ASAS: Maks. <b>${maxUjian} Soal</b> (${isMapelIPA(j.id) ? 'IPA' : 'Non-IPA'})
+                </small>
               </div>
               <span class="ex-badge ${total > 0 ? 'ex-badge-ready' : 'ex-badge-empty'}">
-                ${total > 0 ? `Total: ${total} Soal` : '0 Soal'}
+                ${total > 0 ? `Bank: ${total} Soal` : '0 Soal'}
               </span>
             </div>
             <div class="ex-actions">
@@ -786,7 +851,7 @@
         <label>Target Jurusan / PTN
           <input name="jur" value="${esc(S.jur)}" placeholder="mis. Teknik Informatika — ITS">
         </label>
-        <a href="https://snpmb.id/snbp/daya-tampung-snbp" target="_blank" rel="noopener" class="bt bt-soft" style="text-decoration:none;font-size:13px;">
+        <a href="https://snpmb.bppp.kemdikbud.go.id/" target="_blank" rel="noopener" class="bt bt-soft" style="text-decoration:none;font-size:13px;">
           🌐 Cek Daya Tampung & Prodi di Portal Resmi SNPMB ↗
         </a>
         <label>Target Skor SNBP
@@ -818,7 +883,7 @@
           <p class="mu">Masuk sebagai <b>@${esc(u.username)}</b></p>
           <div style="display:flex;gap:8px;flex-wrap:wrap;">
             <button type="button" class="bt bt-blue" style="flex:1;" onclick="KP.syncPush(false)">↑ Sync ke Cloud</button>
-            <button type="button" class="bt bt-soft" style="flex:1;" onclick="KP.syncPull()">↓ Pulihkan Data</button>
+            <button type="button" class="bt bt-soft" style="flex:1;" onclick="KP.syncPull(false)">↓ Pulihkan Data</button>
           </div>
           <button type="button" class="bt bt-danger" onclick="KP.logout()">Keluar Akun</button>
         </div>
@@ -1070,7 +1135,7 @@
   }
 
   /* =========================================================
-     MODAL TAMBAH SOAL (AKUMULATIF + HAPUS PER SOAL) & PILIH MODE
+     MODAL TAMBAH SOAL (AKUMULATIF + AUTO-SYNC CLOUD) & PILIH MODE
      ========================================================= */
   function openAddModal(mapelId) {
     const j = JADWAL_ASAS.find((x) => x.id === mapelId);
@@ -1085,7 +1150,7 @@
             <button type="button" class="close-x" onclick="KP.closeModal()">✕</button>
           </div>
           <p class="mu" style="margin-bottom:10px;">
-            Soal baru akan <b>ditambahkan</b> ke bank soal yang sudah ada (saat ini: <b>${existingCount} soal</b>). Soal kembar otomatis dilewati.
+            Soal baru akan <b>ditambahkan</b> ke bank soal (saat ini: <b>${existingCount} soal</b>) dan otomatis disinkronkan ke akun Cloud.
           </p>
           <div style="display:flex;gap:8px;margin-bottom:10px;">
             <label class="bt bt-soft" style="flex:1;cursor:pointer;">
@@ -1096,7 +1161,7 @@
           </div>
           <textarea id="up-json-txt" rows="6" placeholder='Tempel JSON soal di sini: {"soal":[{"nomor":1,"materi":"Bab 1","pertanyaan":"...","opsi":{"A":"...","B":"...","C":"...","D":"...","E":"..."},"kunci":"A","pembahasan":"..."}]}'></textarea>
           <div id="up-json-err" style="color:var(--r);font-size:12px;font-weight:700;margin-top:6px;"></div>
-          <button type="button" class="bt" style="width:100%;margin-top:10px;" onclick="KP.saveAddedQuestions('${mapelId}')">
+          <button type="button" id="btn-save-soal" class="bt" style="width:100%;margin-top:10px;" onclick="KP.saveAddedQuestions('${mapelId}')">
             Tambahkan ke Bank Soal
           </button>
 
@@ -1136,15 +1201,16 @@
     list.splice(qIdx, 1);
     BANKS[mapelId] = { id: mapelId, soal: list };
     await idbPut('banks', BANKS[mapelId]);
-    syncPush(true);
+    await syncPush(true);
     go('exam', 1);
     openAddModal(mapelId);
-    toast('Soal dihapus dari bank ✓');
+    toast('Soal dihapus & tersinkron ✓');
   }
 
   async function saveAddedQuestions(mapelId) {
     const raw = $('#up-json-txt').value.replace(/^\uFEFF/, '').trim();
     const err = $('#up-json-err');
+    const saveBtn = $('#btn-save-soal');
     try {
       const parsed = JSON.parse(raw);
       const list = Array.isArray(parsed) ? parsed : parsed.soal;
@@ -1156,6 +1222,11 @@
 
       if (validNew.length === 0) {
         throw new Error('Tidak ditemukan soal pilihan ganda (wajib punya pertanyaan, opsi A–E, dan kunci).');
+      }
+
+      if (saveBtn) {
+        saveBtn.disabled = true;
+        saveBtn.textContent = 'Menyimpan & Sync ke Cloud...';
       }
 
       const currentList = BANKS[mapelId]?.soal ? [...BANKS[mapelId].soal] : [];
@@ -1173,11 +1244,19 @@
 
       BANKS[mapelId] = { id: mapelId, soal: currentList };
       await idbPut('banks', BANKS[mapelId]);
-      syncPush(true);
+      const synced = await syncPush(true);
       closeModal();
       go('exam', 1);
-      toast(`+${addedCount} soal baru ditambahkan (Total: ${currentList.length} soal)`);
+      toast(
+        synced
+          ? `+${addedCount} soal tersimpan & tersinkron Cloud (Total: ${currentList.length})`
+          : `+${addedCount} soal tersimpan lokal (Total: ${currentList.length})`
+      );
     } catch (ex) {
+      if (saveBtn) {
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Tambahkan ke Bank Soal';
+      }
       err.textContent = 'Gagal: ' + ex.message;
     }
   }
@@ -1186,15 +1265,22 @@
     if (!confirm('Apakah kamu yakin ingin menghapus seluruh bank soal pada mata pelajaran ini?')) return;
     BANKS[mapelId] = { id: mapelId, soal: [] };
     await idbPut('banks', BANKS[mapelId]);
-    syncPush(true);
+    await syncPush(true);
     closeModal();
     go('exam', 1);
-    toast('Bank soal dikosongkan.');
+    toast('Bank soal dikosongkan & tersinkron.');
   }
 
   function openModePopup(mapelId) {
     const j = JADWAL_ASAS.find((x) => x.id === mapelId);
     const total = BANKS[mapelId]?.soal?.length || 0;
+    const isIPA = isMapelIPA(mapelId);
+    const maxUjian = getMaxExamQuestions(mapelId);
+    const examDrawCount = Math.min(total, maxUjian);
+
+    const examDesc = total > maxUjian
+      ? `Mengambil <b>${examDrawCount} soal acak</b> dari ${total} soal di bank (maks. ${maxUjian} soal ${isIPA ? 'IPA' : 'Non-IPA'}) dengan timer mundur & tombol ragu-ragu.`
+      : `Mengerjakan seluruh <b>${total} soal</b> (maks. ${maxUjian} soal ${isIPA ? 'IPA' : 'Non-IPA'}) dengan timer mundur & tombol ragu-ragu seperti ujian asli.`;
 
     $('#modal-root').innerHTML = `
       <div class="modal-bg" onclick="if(event.target===this)KP.closeModal()">
@@ -1206,15 +1292,15 @@
           <p class="mu" style="margin-bottom:12px;">Pilih mode pengerjaan yang kamu inginkan:</p>
 
           <div class="mode-choice" onclick="KP.triggerExamCountdown('${mapelId}')">
-            <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">
               <b style="color:var(--b);font-size:15px;">⏱️ Mode Ujian (Simulasi ASAS)</b>
-              <span class="ex-badge ex-badge-ready">${j.menit} Menit</span>
+              <span class="ex-badge ex-badge-ready">${examDrawCount} Soal · ${j.menit} Menit</span>
             </div>
-            <p class="mu" style="margin-top:4px;">Mengerjakan seluruh ${total} soal dengan timer mundur & tombol ragu-ragu seperti ujian asli.</p>
+            <p class="mu" style="margin-top:4px;">${examDesc}</p>
           </div>
 
           <div class="mode-choice quiz" onclick="KP.openQuizSetup('${mapelId}')">
-            <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">
               <b style="color:#EA580C;font-size:15px;">⚡ Mode Kuis Acak</b>
               <span class="ex-badge ex-badge-quiz">Tanpa Timer</span>
             </div>
@@ -1227,16 +1313,22 @@
 
   function triggerExamCountdown(mapelId) {
     const j = JADWAL_ASAS.find((x) => x.id === mapelId);
+    const total = BANKS[mapelId]?.soal?.length || 0;
+    const isIPA = isMapelIPA(mapelId);
+    const maxUjian = getMaxExamQuestions(mapelId);
+    const examDrawCount = Math.min(total, maxUjian);
     let sec = 5;
 
     $('#modal-root').innerHTML = `
       <div class="modal-bg">
         <div class="modal-box" style="text-align:center;">
-          <span class="ex-badge ex-badge-ready">PERSIAPAN UJIAN ASAS</span>
+          <span class="ex-badge ex-badge-ready">PERSIAPAN UJIAN ASAS (${isIPA ? 'IPA' : 'NON-IPA'})</span>
           <h3 style="margin-top:10px;font-size:18px;">${esc(j.mapel)}</h3>
           <p class="mu" style="margin-top:4px;">Ujian akan dimulai dalam</p>
           <div class="cd-circle" id="cd-num">5</div>
-          <p class="mu" style="margin-bottom:14px;">Durasi: <b>${j.menit} menit</b> · Jangan keluar halaman saat timer berjalan.</p>
+          <p class="mu" style="margin-bottom:14px;">
+            Jumlah: <b>${examDrawCount} Soal</b> (Maks. ${maxUjian}) · Durasi: <b>${j.menit} menit</b>
+          </p>
           <button type="button" class="bt bt-soft" style="width:100%;" onclick="KP.closeModal()">Batal</button>
         </div>
       </div>
@@ -1250,7 +1342,7 @@
         clearInterval(countdownId);
         countdownId = null;
         closeModal();
-        startSession(mapelId, 'UJIAN', '__ALL__', BANKS[mapelId].soal.length);
+        startSession(mapelId, 'UJIAN', '__ALL__', maxUjian);
       }
     }, 1000);
   }
@@ -1326,9 +1418,15 @@
     const filtered = babKey === '__ALL__' ? pool : pool.filter((s) => (s.materi || 'Materi Umum') === babKey);
     if (filtered.length === 0) return toast('Tidak ada soal untuk pilihan ini.');
 
-    const questions = mode === 'KUIS'
-      ? shuffleArray(filtered).slice(0, Math.min(count, filtered.length))
-      : filtered.slice();
+    let questions;
+    if (mode === 'KUIS') {
+      questions = shuffleArray(filtered).slice(0, Math.min(count, filtered.length));
+    } else {
+      const maxUjian = getMaxExamQuestions(mapelId);
+      questions = filtered.length > maxUjian
+        ? shuffleArray(filtered).slice(0, maxUjian)
+        : filtered.slice();
+    }
 
     const totalSec = j.menit * 60;
     cbtSession = {
@@ -1782,7 +1880,7 @@
   };
 
   /* =========================================================
-     INIT APP
+     INIT APP & AUTO-SYNC LINTAS PERANGKAT
      ========================================================= */
   $('#nav').innerHTML = [
     ['home', 'Beranda', '🏠'],
@@ -1803,11 +1901,29 @@
 
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
-  window.addEventListener('online', () => {
+
+  window.addEventListener('online', async () => {
     updateSyncPill();
-    if (localStorage.getItem(PENDING_SYNC_KEY) === '1') syncPush(true);
+    if (!getSession()) return;
+    if (localStorage.getItem(PENDING_SYNC_KEY) === '1') {
+      await syncPush(true);
+    } else {
+      await syncPull(true);
+    }
   });
+
   window.addEventListener('offline', updateSyncPill);
+
+  // Otomatis tarik data terbaru dari Cloud saat pindah dari Laptop ke Tablet/HP
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && getSession() && navigator.onLine && !cbtSession) {
+      if (localStorage.getItem(PENDING_SYNC_KEY) === '1') {
+        syncPush(true);
+      } else {
+        syncPull(true);
+      }
+    }
+  });
 
   (async function boot() {
     D = await idbGetAll('grades');
@@ -1822,8 +1938,12 @@
       renderAuthGate();
     } else {
       go('home');
-      if (localStorage.getItem(PENDING_SYNC_KEY) === '1' && navigator.onLine) {
-        syncPush(true);
+      if (navigator.onLine) {
+        if (localStorage.getItem(PENDING_SYNC_KEY) === '1') {
+          await syncPush(true);
+        } else {
+          await syncPull(true);
+        }
       }
     }
   })();
